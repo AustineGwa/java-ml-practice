@@ -1,24 +1,42 @@
 package org.example.djl.training.linearregression;
 
+import ai.djl.Model;
 import ai.djl.engine.Engine;
+import ai.djl.metric.Metrics;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import ai.djl.nn.Block;
+import ai.djl.nn.ParameterList;
+import ai.djl.nn.SequentialBlock;
+import ai.djl.nn.core.Linear;
+import ai.djl.training.DefaultTrainingConfig;
+import ai.djl.training.EasyTrain;
 import ai.djl.training.GradientCollector;
+import ai.djl.training.Trainer;
 import ai.djl.training.dataset.ArrayDataset;
 import ai.djl.training.dataset.Batch;
+import ai.djl.training.listener.TrainingListener;
+import ai.djl.training.loss.Loss;
+import ai.djl.training.optimizer.Optimizer;
+import ai.djl.training.tracker.Tracker;
 import ai.djl.translate.TranslateException;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 public class LinearRegression {
 
     public static void main(String[] args) {
+
         try {
-            manualImplementation();
+//            manualImplementation();
+            conciseDjlImplementation();
         } catch (TranslateException e) {
             throw new RuntimeException(e);
         } catch (IOException e) {
@@ -26,8 +44,112 @@ public class LinearRegression {
         }
     }
 
-    static void conciseDjlImplementation(){
+    static void conciseDjlImplementation() throws TranslateException, IOException {
 
+        //generating the dataset
+        NDManager manager = NDManager.newBaseManager();
+        NDArray trueW = manager.create(new float[]{2, -3.4f});
+        float trueB = 4.2f;
+
+        DataPoints dp = DataPoints.syntheticData(manager, trueW, trueB, 1000);
+        NDArray features = dp.getX();
+        NDArray labels = dp.getY();
+
+//        //reading the dataset
+        int batchSize = 10;
+        ArrayDataset dataset = Utils.loadArray(features, labels, batchSize, false);
+//
+//        Batch batch = dataset.getData(manager).iterator().next();
+//        NDArray X = batch.getData().head();
+//        NDArray y = batch.getLabels().head();
+//        System.out.println(X);
+//        System.out.println(y);
+//        batch.close();
+
+//        defining the model
+        Model model = Model.newInstance("lin-reg");
+        SequentialBlock net = new SequentialBlock();
+        Linear linearBlock = Linear.builder().optBias(true).setUnits(1).build();
+        net.add(linearBlock);
+        model.setBlock(net);
+
+        //Defining the loss function
+        //L2 Loss or ‘Mean Squared Error’ is the sum of the squared difference between the true y value and the predicted y value.
+        Loss l2loss = Loss.l2Loss();
+
+        //defining the optimization algorithm
+        Tracker lrt = Tracker.fixed(0.03f);
+        Optimizer sgd = Optimizer.sgd().setLearningRateTracker(lrt).build();
+
+        //instantiate configuration and trainer
+        DefaultTrainingConfig config = new DefaultTrainingConfig(l2loss)
+                .optOptimizer(sgd) // Optimizer (loss function)
+                .optDevices(manager.getEngine().getDevices(1)) // single GPU
+                .addTrainingListeners(TrainingListener.Defaults.logging()); // Logging
+
+        Trainer trainer = model.newTrainer(config);
+
+        //initialize model parameters
+        // First axis is batch size - won't impact parameter initialization
+        // Second axis is the input size
+        trainer.initialize(new Shape(batchSize, 2));
+
+
+        //metrics
+        Metrics metrics = new Metrics();
+        trainer.setMetrics(metrics);
+
+        //training
+
+        int numEpochs = 3;
+
+        for (int epoch = 1; epoch <= numEpochs; epoch++) {
+            System.out.printf("Epoch %d\n", epoch);
+            // Iterate over dataset
+            for (Batch batch : trainer.iterateDataset(dataset)) {
+                // Update loss and evaulator
+                EasyTrain.trainBatch(trainer, batch);
+
+                // Update parameters
+                trainer.step();
+
+                batch.close();
+            }
+            // reset training and validation evaluators at end of epoch
+            trainer.notifyListeners(listener -> listener.onEpoch(trainer));
+        }
+
+        Block layer = model.getBlock();
+        ParameterList params = layer.getParameters();
+        NDArray wParam = params.valueAt(0).getArray();
+        NDArray bParam = params.valueAt(1).getArray();
+
+        float[] w = trueW.sub(wParam.reshape(trueW.getShape())).toFloatArray();
+        System.out.printf("Error in estimating w: [%f %f]\n", w[0], w[1]);
+        System.out.printf("Error in estimating b: %f\n", trueB - bParam.getFloat());
+
+        //saving the model
+        Path modelDir = Paths.get("../models/lin-reg");
+        Files.createDirectories(modelDir);
+
+        model.setProperty("Epoch", Integer.toString(numEpochs)); // save epochs trained as metadata
+
+        model.save(modelDir, "lin-reg");
+
+        System.out.println(model);
+
+
+    }
+
+    class Utils{
+        // Saved in the utils file for later use
+        public static ArrayDataset loadArray(NDArray features, NDArray labels, int batchSize, boolean shuffle) {
+            return new ArrayDataset.Builder()
+                    .setData(features) // set the features
+                    .optLabels(labels) // set the labels
+                    .setSampling(batchSize, shuffle) // set the batch size and random sampling
+                    .build();
+        }
     }
 
     static void manualImplementation() throws TranslateException, IOException {
@@ -37,7 +159,7 @@ public class LinearRegression {
         NDArray trueW = manager.create(new float[]{2, -3.4f});
         float trueB = 4.2f;
 
-        DataPoints dp = syntheticData(manager, trueW, trueB, 1000);
+        DataPoints dp = DataPoints.syntheticData(manager, trueW, trueB, 1000);
         NDArray features = dp.getX();
         NDArray labels = dp.getY();
 
@@ -120,15 +242,6 @@ public class LinearRegression {
 
 
     }
-
-    // Generate y = X w + b + noise
-    public static  DataPoints syntheticData(NDManager manager, NDArray w, float b, int numExamples) {
-        NDArray X = manager.randomNormal(new Shape(numExamples, w.size()));
-        NDArray y = X.dot(w).add(b);
-        // Add noise
-        y = y.add(manager.randomNormal(0, 0.01f, y.getShape(), DataType.FLOAT32));
-        return new DataPoints(X, y);
-    }
 }
 
 class DataPoints {
@@ -144,6 +257,15 @@ class DataPoints {
 
     public NDArray getY() {
         return y;
+    }
+
+    // Generate y = X w + b + noise
+    public static  DataPoints syntheticData(NDManager manager, NDArray w, float b, int numExamples) {
+        NDArray X = manager.randomNormal(new Shape(numExamples, w.size()));
+        NDArray y = X.dot(w).add(b);
+        // Add noise
+        y = y.add(manager.randomNormal(0, 0.01f, y.getShape(), DataType.FLOAT32));
+        return new DataPoints(X, y);
     }
 }
 
